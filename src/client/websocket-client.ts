@@ -271,7 +271,15 @@ export class RobustSessionClient extends EventEmitter {
   async listSessions() {
     return this.request('session.list');
   }
-  
+
+  async setSessionPersistent(sessionId: string, persistent: boolean) {
+    return this.request('session.setPersistent', { sessionId, persistent });
+  }
+
+  async pruneIdleSessions(params: any) {
+    return this.request('session.pruneIdle', params);
+  }
+
   async startService(params: any) {
     return this.request('service.start', params);
   }

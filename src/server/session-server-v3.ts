@@ -26,6 +26,8 @@ interface SessionInfo {
   cwd: string;
   env: Record<string, string>;
   isAlive: boolean;
+  /** Whether automatic idle GC may remove this session. */
+  persistent: boolean;
   createdAt: Date;
   lastActivity: Date;
   outputBuffer: string;
@@ -201,6 +203,10 @@ type PublicSessionInfo = {
   cwd: string;
   env: Record<string, string>;
   isAlive: boolean;
+  persistent: boolean;
+  shellAtPrompt: boolean;
+  isProcessingCommand: boolean;
+  queuedCommandCount: number;
   createdAt: Date;
   lastActivity: Date;
   logSize: number;
@@ -445,7 +451,7 @@ export class PersistentSessionServer extends EventEmitter {
   /**
    * Create a new shell session
    */
-  async createSession(id: string, options: { cwd?: string; env?: Record<string, string>; shell?: string } = {}): Promise<string> {
+  async createSession(id: string, options: { cwd?: string; env?: Record<string, string>; shell?: string; persistent?: boolean } = {}): Promise<string> {
     if (this.sessions.has(id)) {
       throw new Error(`Session ${id} already exists`);
     }
@@ -474,6 +480,7 @@ export class PersistentSessionServer extends EventEmitter {
       cwd,
       env: options.env || {},
       isAlive: true,
+      persistent: options.persistent ?? true,
       createdAt: new Date(),
       lastActivity: new Date(),
       outputBuffer: '',
@@ -634,6 +641,10 @@ export class PersistentSessionServer extends EventEmitter {
       // Small settle window for the prompt that follows the marker.
       await this.sleep(50);
 
+      // The ready marker completed at the prompt; an auto-created idle
+      // session is safe for idle GC until input or a command starts.
+      session.shellAtPrompt = true;
+
       // Clear the startup output. The line buffer is kept, as on main: it
       // holds the prompt that followed the marker, and getOutput appends it to
       // the logs, so the GUI's first read of a fresh session shows the prompt.
@@ -656,6 +667,10 @@ export class PersistentSessionServer extends EventEmitter {
     if (!session.isAlive) {
       throw new Error(`Session ${sessionId} is not alive`);
     }
+
+    // An accepted command is activity immediately, before its marker reaches
+    // the PTY. A concurrent idle-GC recheck must not act on the old timestamp.
+    session.lastActivity = new Date();
 
     return new Promise((resolve) => {
       const startTime = Date.now();
@@ -1961,6 +1976,10 @@ export class PersistentSessionServer extends EventEmitter {
     id: string;
     name: string;
     isAlive: boolean;
+    persistent: boolean;
+    shellAtPrompt: boolean;
+    isProcessingCommand: boolean;
+    queuedCommandCount: number;
     createdAt: Date;
     lastActivity: Date;
     logSize: number;
@@ -1969,10 +1988,74 @@ export class PersistentSessionServer extends EventEmitter {
       id,
       name: session.name,
       isAlive: session.isAlive,
+      persistent: session.persistent,
+      shellAtPrompt: session.shellAtPrompt,
+      isProcessingCommand: session.isProcessingCommand,
+      queuedCommandCount: session.commandQueue.length,
       createdAt: session.createdAt,
       lastActivity: session.lastActivity,
       logSize: session.logs.length
     }));
+  }
+
+  /** Change whether idle fleet GC may remove a session. */
+  setSessionPersistent(sessionId: string, persistent: boolean): { id: string; persistent: boolean } {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session ${sessionId} not found`);
+    session.persistent = persistent;
+    return { id: session.id, persistent: session.persistent };
+  }
+
+  /**
+   * Remove only auto-created, idle-at-prompt sessions when the fleet grows
+   * beyond maxSessions. This lives beside the PTYs so MCP reconnects cannot
+   * forget protection and command state is rechecked at the kill boundary.
+   */
+  async pruneIdleSessions(options: {
+    maxSessions?: number;
+    idleMs?: number;
+    maxPrune?: number;
+    protectedSessionIds?: string[];
+  } = {}): Promise<{ pruned: string[]; failed: Array<{ id: string; error: string }> }> {
+    const maxSessions = Math.max(1, options.maxSessions ?? 64);
+    const idleMs = Math.max(0, options.idleMs ?? 60 * 60 * 1000);
+    const maxPrune = Math.max(1, options.maxPrune ?? 32);
+    const protectedIds = new Set(options.protectedSessionIds ?? []);
+    if (this.sessions.size < maxSessions) return { pruned: [], failed: [] };
+
+    const cutoff = Date.now() - idleMs;
+    const eligible = (session: SessionInfo): boolean => {
+      if (protectedIds.has(session.id) || session.persistent) return false;
+      if (!session.isAlive) return true;
+      return session.shellAtPrompt &&
+        !session.isProcessingCommand &&
+        session.commandQueue.length === 0 &&
+        session.lastActivity.getTime() < cutoff;
+    };
+
+    const candidates = Array.from(this.sessions.values())
+      .filter(eligible)
+      .sort((a, b) => a.lastActivity.getTime() - b.lastActivity.getTime());
+    const needed = Math.max(0, this.sessions.size - (maxSessions - 1));
+    const selected = candidates.slice(0, Math.min(needed, maxPrune));
+
+    const results = await Promise.all(selected.map(async candidate => {
+      // A command/input may have arrived after selection. Re-read the live
+      // object immediately before the force-kill; never act on the snapshot.
+      const current = this.sessions.get(candidate.id);
+      if (!current || !eligible(current)) return { id: candidate.id, pruned: false };
+      try {
+        await this.killSession(candidate.id, true);
+        return { id: candidate.id, pruned: true };
+      } catch (error) {
+        return { id: candidate.id, pruned: false, error: (error as Error).message };
+      }
+    }));
+
+    return {
+      pruned: results.filter(result => result.pruned).map(result => result.id),
+      failed: results.filter(result => result.error).map(result => ({ id: result.id, error: result.error! }))
+    };
   }
 
   /**
@@ -2210,6 +2293,10 @@ export class PersistentSessionServer extends EventEmitter {
       cwd: session.cwd,
       env: session.env,
       isAlive: session.isAlive,
+      persistent: session.persistent,
+      shellAtPrompt: session.shellAtPrompt,
+      isProcessingCommand: session.isProcessingCommand,
+      queuedCommandCount: session.commandQueue.length,
       createdAt: session.createdAt,
       lastActivity: session.lastActivity,
       logSize: session.logs.length

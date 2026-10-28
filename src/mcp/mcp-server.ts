@@ -38,6 +38,7 @@ export class ConnectomeTestingMCP {
   private apiUrl: string;
   private authToken?: string;
   private serviceMap = new Map<string, string>(); // name -> sessionId
+  private activeRunTargets = new Map<string, number>(); // concurrent runCommand target refcounts for idle-GC protection
   
   constructor(apiUrl: string = 'ws://localhost:3100', authToken?: string) {
     this.apiUrl = apiUrl;
@@ -128,38 +129,55 @@ export class ConnectomeTestingMCP {
     cwd?: string; // Working directory (used when auto-creating session)
     timeout?: number; // Command timeout in ms (default: 30000)
     raw?: boolean; // If true, preserve raw ANSI codes
+    persistent?: boolean; // Protect this session from automatic idle GC
   }): Promise<CommandResult> {
     const sessionId = this.serviceMap.get(params.session) || params.session;
+    this.activeRunTargets.set(sessionId, (this.activeRunTargets.get(sessionId) ?? 0) + 1);
 
-    // Create the session if it's missing, and keep the creation's own error,
-    // such as a shared server's session limit: going on to exec would hide it
-    // behind "Session ... not found". A listing whose connection is lost
-    // while it's in flight is tried once more on a fresh one, as listSessions
-    // is, and a listing that still fails fails the call with its error.
-    const sessions = await this.withConnectionRetry(() => this.getClient().listSessions());
-    const exists = sessions.some((s: any) => s.id === sessionId);
-    if (!exists) {
-      try {
-        await this.createSession({ id: sessionId, cwd: params.cwd });
-      } catch (creationError) {
-        // The session may exist after all, made by another call after our
-        // listing, or by this call's own create whose answer was lost. The
-        // command then runs in it. A second listing decides that, not the
-        // error's wording.
-        const current = await this.getClient().listSessions().catch(() => []);
-        if (!current.some((s: any) => s.id === sessionId)) throw creationError;
+    try {
+      const sessions = await this.withConnectionRetry(() => this.getClient().listSessions());
+      const exists = sessions.some((session: any) => session.id === sessionId);
+      if (!exists) {
+        try {
+          await this.createSession({
+            id: sessionId,
+            cwd: params.cwd,
+            // Explicit createSession calls and services remain persistent by
+            // default. Only runCommand's auto-created shells opt into idle GC.
+            persistent: params.persistent ?? false
+          });
+        } catch (creationError) {
+          const current = await this.getClient().listSessions().catch(() => []);
+          if (!current.some((session: any) => session.id === sessionId)) throw creationError;
+          if (params.persistent !== undefined) {
+            await this.getClient().setSessionPersistent(sessionId, params.persistent);
+          }
+        }
+      } else if (params.persistent !== undefined) {
+        await this.getClient().setSessionPersistent(sessionId, params.persistent);
       }
+
+      const result = await this.getClient().exec(sessionId, params.command, params.timeout);
+      return {
+        ...result,
+        output: cleanTerminalOutput(result.output, { raw: params.raw })
+      };
+    } finally {
+      const protectedSessionIds = Array.from(this.activeRunTargets.keys());
+      await this.getClient().pruneIdleSessions({
+        maxSessions: 64,
+        idleMs: 60 * 60 * 1000,
+        maxPrune: 32,
+        protectedSessionIds
+      }).catch((error: Error) => {
+        if (process.env.MCP_DEBUG) console.error('[MCP] idle prune failed:', error.message);
+      });
+      const remaining = (this.activeRunTargets.get(sessionId) ?? 1) - 1;
+      if (remaining > 0) this.activeRunTargets.set(sessionId, remaining);
+      else this.activeRunTargets.delete(sessionId);
     }
-
-    const result = await this.getClient().exec(sessionId, params.command, params.timeout);
-
-    // Clean output unless raw mode is requested
-    return {
-      ...result,
-      output: cleanTerminalOutput(result.output, { raw: params.raw })
-    };
   }
-  
+
   /**
    * Get recent output from a session
    * @tool
@@ -212,6 +230,7 @@ export class ConnectomeTestingMCP {
   async listSessions(): Promise<Array<{
     id: string;
     name?: string;
+    persistent: boolean;
     isAlive: boolean;
     createdAt: Date;
     lastActivity: Date;
@@ -231,6 +250,7 @@ export class ConnectomeTestingMCP {
       return {
         id: session.id,
         name,
+        persistent: session.persistent,
         isAlive: session.isAlive,
         createdAt: session.createdAt,
         lastActivity: session.lastActivity,
@@ -279,6 +299,7 @@ export class ConnectomeTestingMCP {
     id: string;
     cwd?: string;
     env?: Record<string, string>;
+    persistent?: boolean;
   }): Promise<{
     sessionId: string;
     info: any;

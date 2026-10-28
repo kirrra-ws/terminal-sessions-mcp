@@ -98,7 +98,8 @@ const TOOLS = {
         command: { type: 'string' },
         cwd: { type: 'string', description: 'Working directory (used when auto-creating a new session)' },
         timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command, one still being typed in included, goes on to run (exitCode -1 in the result) unless its body is given up, which the session log says, or a Ctrl-C discarded its line, and commands sent meanwhile are typed in behind it: they run when it ends, or become its input if it reads any. Where the shell in front can\'t read this machine\'s temp files, a long command goes in a line at a time, and the round trips count against its timeout. Use tailLogs to check on a running command, sendInput to answer it (refused while a command is still on its way in, since the shell in front could read the input instead, so input sent straight after a return with -1, or while commands sent meanwhile go in, may need sending again), or sendSignal with SIGINT (the default) to interrupt it. Its Ctrl-C gives up a command whose body is still being typed in, which then never runs, and can discard or give up the commands typed in behind it; sendSignal\'s description says which. Other signals go to the session\'s shell itself.' },
-        raw: { type: 'boolean', description: 'If true, preserve raw ANSI escape codes in output (default: false, returns clean text)' }
+        raw: { type: 'boolean', description: 'If true, preserve raw ANSI escape codes in output (default: false, returns clean text)' },
+        persistent: { type: 'boolean', description: 'Protect this auto-created session from idle fleet pruning. Omit for ordinary command sessions.' }
       },
       required: ['session', 'command']
     }

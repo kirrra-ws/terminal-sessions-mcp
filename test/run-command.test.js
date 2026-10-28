@@ -2,7 +2,11 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {ConnectomeTestingMCP}=require('../dist/src/mcp/mcp-server');
 
-function wrapper(client){const m=new ConnectomeTestingMCP();m.getClient=()=>client;return m;}
+function wrapper(client){
+  client.pruneIdleSessions ??= async()=>({pruned:[],failed:[]});
+  client.setSessionPersistent ??= async()=>({});
+  const m=new ConnectomeTestingMCP();m.getClient=()=>client;return m;
+}
 
 test('runCommand retains session-limit failure instead of executing a missing session',async()=>{
   let executed=false;
@@ -53,7 +57,7 @@ test('runCommand creates a missing session under its service-mapped id, with the
   const m=wrapper({listSessions:async()=>[{id:'other'}],createSession:async(p)=>{created.push(p);return {sessionId:p.id};},exec:async(id)=>{executed.push(id);return {output:'ready',exitCode:0,duration:1};}});
   m.serviceMap.set('web','svc-1');
   assert.equal((await m.runCommand({session:'web',command:'pwd',cwd:'/srv'})).output,'ready');
-  assert.deepEqual(created,[{id:'svc-1',cwd:'/srv'}]);
+  assert.deepEqual(created,[{id:'svc-1',cwd:'/srv',persistent:false}]);
   assert.deepEqual(executed,['svc-1']);
 });
 

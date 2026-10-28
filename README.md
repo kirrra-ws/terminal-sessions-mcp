@@ -156,6 +156,8 @@ Your AI assistant now has access to these MCP tools:
 
 - `startService` - Start a service with readiness detection
 - `runCommand` - Execute a command in a session
+  - auto-created command sessions are eligible for idle fleet pruning after one hour at a shell prompt once the fleet reaches 64 sessions
+  - pass `persistent: true` to protect a long-lived command session; explicit `createSession` calls and launched services are persistent by default
 - `tailLogs` - Get recent output from a session  
 - `searchLogs` - Search through output with regex
 - `sendInput` - Send input to interactive prompts (with named-key support for TUIs)
