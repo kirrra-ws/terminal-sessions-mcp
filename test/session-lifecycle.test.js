@@ -138,3 +138,76 @@ test('same-session concurrent calls keep the target protected until both settle'
   await first;
   assert.equal(mcp.activeRunTargets.has('same'), false);
 });
+
+test('prune rechecks live state immediately before kill', async () => {
+  const server = new PersistentSessionServer();
+  const sessions = [['candidate', fakeSession('candidate')]];
+  for (let i = 0; i < 63; i++) sessions.push([`keep-${i}`, fakeSession(`keep-${i}`, { persistent: true })]);
+  server.sessions = new Map(sessions);
+  const originalGet = server.sessions.get.bind(server.sessions);
+  let changed = false;
+  server.sessions.get = (id) => {
+    const session = originalGet(id);
+    if (id === 'candidate' && !changed) {
+      session.shellAtPrompt = false;
+      session.isProcessingCommand = true;
+      changed = true;
+    }
+    return session;
+  };
+  let kills = 0;
+  server.killSession = async () => { kills++; };
+  assert.deepEqual(await server.pruneIdleSessions({ maxSessions: 64 }), { pruned: [], failed: [] });
+  assert.equal(kills, 0);
+  server.sessions.clear();
+});
+
+test('prune removes at most the configured batch cap', async () => {
+  const server = new PersistentSessionServer();
+  const now = Date.now();
+  const sessions = Array.from({ length: 100 }, (_, i) => fakeSession(`old-${i}`, {
+    last: now - (3 * 60 * 60 * 1000) - i * 1000
+  }));
+  server.sessions = new Map(sessions.map(session => [session.id, session]));
+  const killed = [];
+  server.killSession = async (id) => { killed.push(id); server.sessions.delete(id); };
+  const result = await server.pruneIdleSessions({ maxSessions: 64, maxPrune: 32 });
+  assert.equal(result.pruned.length, 32);
+  assert.deepEqual(killed, Array.from({ length: 32 }, (_, index) => `old-${99-index}`));
+  assert.equal(server.sessions.size, 68);
+  server.sessions.clear();
+});
+
+test('prune reports failed kills without hiding successful removals', async () => {
+  const server = new PersistentSessionServer();
+  const now = Date.now();
+  const sessions = Array.from({ length: 66 }, (_, i) => fakeSession(`old-${i}`, {
+    last: now - (3 * 60 * 60 * 1000) - i * 1000
+  }));
+  server.sessions = new Map(sessions.map(session => [session.id, session]));
+  server.killSession = async (id) => {
+    if (id === 'old-65') throw new Error('refused for test');
+    server.sessions.delete(id);
+  };
+  const result = await server.pruneIdleSessions({ maxSessions: 64, maxPrune: 32 });
+  assert.deepEqual(result.pruned.sort(), ['old-63', 'old-64']);
+  assert.deepEqual(result.failed, [{ id: 'old-65', error: 'refused for test' }]);
+  assert.equal(server.sessions.has('old-65'), true);
+  server.sessions.clear();
+});
+
+test('persistence can be toggled in both directions and remains an explicit GC opt-out', async () => {
+  const server = new PersistentSessionServer();
+  const sessions = [['work', fakeSession('work', { persistent: true, alive: false })]];
+  for (let i = 0; i < 63; i++) sessions.push([`keep-${i}`, fakeSession(`keep-${i}`, { persistent: true })]);
+  server.sessions = new Map(sessions);
+  let kills = 0;
+  server.killSession = async (id) => { kills++; server.sessions.delete(id); };
+  assert.deepEqual(await server.pruneIdleSessions({ maxSessions: 64 }), { pruned: [], failed: [] });
+  assert.equal(kills, 0, 'even a dead persistent session survives automatic GC');
+  assert.equal(server.setSessionPersistent('work', false).persistent, false);
+  const result = await server.pruneIdleSessions({ maxSessions: 64 });
+  assert.deepEqual(result.pruned, ['work']);
+  assert.equal(server.sessions.has('work'), false);
+  server.sessions.clear();
+});
